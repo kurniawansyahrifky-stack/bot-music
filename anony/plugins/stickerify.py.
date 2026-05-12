@@ -1,0 +1,281 @@
+# anony/plugins/stickerify.py
+
+import io
+import os
+import uuid
+
+from PIL import Image
+
+from pyrogram import filters
+from pyrogram.types import Message
+
+from anony import app
+
+# Optional remove background
+try:
+    from rembg import remove
+    REMBG_AVAILABLE = True
+except ImportError:
+    REMBG_AVAILABLE = False
+
+
+# =========================================================
+# CONFIG
+# =========================================================
+MAX_SIZE = 320  # ukuran maksimal sisi terpanjang (seperti userbot)
+
+
+# =========================================================
+# RESIZE TANPA BACKGROUND PUTIH
+# =========================================================
+def resize_sticker(img: Image.Image) -> Image.Image:
+    """
+    Resize gambar agar sisi terpanjang = 320px.
+    Tanpa canvas putih.
+    Hasil PNG transparan / normal.
+    """
+    img = img.convert("RGBA")
+
+    w, h = img.size
+
+    # Jika gambar lebih kecil dari 320, biarkan ukuran asli
+    if max(w, h) <= MAX_SIZE:
+        return img
+
+    # Resize proporsional
+    ratio = MAX_SIZE / max(w, h)
+    new_w = int(w * ratio)
+    new_h = int(h * ratio)
+
+    img = img.resize((new_w, new_h), Image.LANCZOS)
+    return img
+
+
+# =========================================================
+# CREATE / ADD STICKER PACK
+# =========================================================
+async def add_to_sticker_pack(
+    user_id: int,
+    first_name: str,
+    sticker_file: str,
+    bot_username: str,
+):
+    """
+    Membuat atau menambahkan sticker ke pack.
+    Menggunakan @Stickers agar kompatibel semua versi Pyrogram.
+    """
+
+    import asyncio
+
+    pack_name = f"{user_id}_{uuid.uuid4().hex[:6]}_by_{bot_username}"
+    pack_title = f"{first_name}'s Sticker Pack"
+
+    # Buat conversation manual ke @Stickers
+    async with app.conversation("Stickers", timeout=120) as conv:
+        # /newpack
+        await conv.send_message("/newpack")
+        await conv.get_response()
+
+        # title
+        await conv.send_message(pack_title)
+        await conv.get_response()
+
+        # kirim sticker
+        await conv.send_document(sticker_file)
+        await conv.get_response()
+
+        # emoji
+        await conv.send_message("🤔")
+        await conv.get_response()
+
+        # publish
+        await conv.send_message("/publish")
+        await conv.get_response()
+
+        # skip icon
+        await conv.send_message("/skip")
+        await conv.get_response()
+
+        # short name
+        await conv.send_message(pack_name)
+        await conv.get_response()
+
+        await asyncio.sleep(1)
+
+    return f"https://t.me/addstickers/{pack_name}"
+
+
+# =========================================================
+# /kang
+# =========================================================
+@app.on_message(filters.command(["kang", "sticker"]))
+async def kang_sticker(_, message: Message):
+    if not message.reply_to_message:
+        return await message.reply_text(
+            "Balas foto/sticker dengan:\n<code>/kang</code>"
+        )
+
+    reply = message.reply_to_message
+    status = await message.reply_text("⏳ Membuat sticker...")
+
+    path = None
+    sticker_path = None
+
+    try:
+        # =========================
+        # DOWNLOAD MEDIA
+        # =========================
+        if reply.photo:
+            path = await reply.download()
+
+        elif reply.sticker:
+            path = await reply.download()
+
+        else:
+            return await status.edit_text(
+                "Balas foto atau sticker."
+            )
+
+        # =========================
+        # OPEN IMAGE
+        # =========================
+        img = Image.open(path).convert("RGBA")
+
+        # =========================
+        # RESIZE PROPORSIONAL
+        # =========================
+        img = resize_sticker(img)
+
+        # =========================
+        # SAVE PNG
+        # =========================
+        sticker_path = f"/tmp/{uuid.uuid4().hex}.png"
+        img.save(sticker_path, "PNG")
+
+        # =========================
+        # SEND STICKER
+        # =========================
+        sent = await message.reply_sticker(sticker_path)
+
+        # =========================
+        # CREATE STICKER PACK
+        # =========================
+        try:
+            me = await app.get_me()
+            user = message.from_user
+
+            pack_link = await add_to_sticker_pack(
+                user_id=user.id,
+                first_name=user.first_name or "User",
+                sticker_file=sticker_path,
+                bot_username=me.username,
+            )
+
+            await message.reply_text(
+                "Sticker Anda Berhasil Dibuat!\n"
+                f"👀 Lihat Paket Sticker Disini\n"
+                f"{pack_link}\n"
+                f"Emoji: 🤔",
+                disable_web_page_preview=False,
+            )
+
+        except Exception:
+            await message.reply_text(
+                "Sticker berhasil dibuat, tapi gagal membuat sticker pack."
+            )
+
+        await status.delete()
+
+    except Exception as e:
+        await status.edit_text(
+            f"❌ Error:\n<code>{e}</code>"
+        )
+
+    finally:
+        for file in [path, sticker_path]:
+            if file and os.path.exists(file):
+                os.remove(file)
+
+
+# =========================================================
+# /rmbg
+# =========================================================
+@app.on_message(filters.command("rmbg"))
+async def rmbg_sticker(_, message: Message):
+    if not REMBG_AVAILABLE:
+        return await message.reply_text(
+            "rembg belum terinstall.\n"
+            "Install dengan:\n<code>pip install rembg</code>"
+        )
+
+    if not message.reply_to_message or not message.reply_to_message.photo:
+        return await message.reply_text(
+            "Balas foto dengan:\n<code>/rmbg</code>"
+        )
+
+    status = await message.reply_text(
+        "⏳ Menghapus background..."
+    )
+
+    path = None
+    output_path = None
+
+    try:
+        path = await message.reply_to_message.download()
+
+        with open(path, "rb") as f:
+            result = remove(f.read())
+
+        img = Image.open(io.BytesIO(result)).convert("RGBA")
+        img = resize_sticker(img)
+
+        output_path = f"/tmp/{uuid.uuid4().hex}.png"
+        img.save(output_path, "PNG")
+
+        await message.reply_sticker(output_path)
+        await status.delete()
+
+    except Exception as e:
+        await status.edit_text(
+            f"❌ Error:\n<code>{e}</code>"
+        )
+
+    finally:
+        for file in [path, output_path]:
+            if file and os.path.exists(file):
+                os.remove(file)
+
+
+# =========================================================
+# /toimg
+# =========================================================
+@app.on_message(filters.command("toimg"))
+async def toimg(_, message: Message):
+    if (
+        not message.reply_to_message
+        or not message.reply_to_message.sticker
+    ):
+        return await message.reply_text(
+            "Balas sticker dengan:\n<code>/toimg</code>"
+        )
+
+    status = await message.reply_text(
+        "⏳ Mengubah sticker ke gambar..."
+    )
+
+    path = None
+
+    try:
+        path = await message.reply_to_message.download()
+
+        await message.reply_photo(path)
+        await status.delete()
+
+    except Exception as e:
+        await status.edit_text(
+            f"❌ Error:\n<code>{e}</code>"
+        )
+
+    finally:
+        if path and os.path.exists(path):
+            os.remove(path)

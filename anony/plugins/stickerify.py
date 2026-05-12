@@ -1,0 +1,419 @@
+# anony/plugins/stickerify.py
+#
+# Fixed version for AnonXMusic
+# - /kang works with assistant userbot
+# - Fix USER_IS_BOT
+# - Fix save_file_semaphore
+# - Fix NoneType object has no attribute 'id'
+
+import os
+import traceback
+from PIL import Image
+
+from pyrogram import filters
+from pyrogram.file_id import FileId
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.errors import BadRequest, StickersetInvalid
+
+from pyrogram.raw.functions.messages import GetStickerSet
+from pyrogram.raw.functions.stickers import (
+    AddStickerToSet,
+    CreateStickerSet,
+    RemoveStickerFromSet,
+)
+from pyrogram.raw.types import (
+    InputDocument,
+    InputStickerSetItem,
+    InputStickerSetShortName,
+)
+
+from anony import app, userbot
+
+
+# =========================================================
+# GET REAL USERBOT CLIENT
+# =========================================================
+def get_ubot():
+    if hasattr(userbot, "one") and userbot.one:
+        return userbot.one
+
+    if hasattr(userbot, "clients") and userbot.clients:
+        return userbot.clients[0]
+
+    if hasattr(userbot, "assistant") and userbot.assistant:
+        return userbot.assistant
+
+    return userbot
+
+
+# =========================================================
+# INLINE KEYBOARD BUILDER
+# =========================================================
+def ikb(buttons):
+    keyboard = []
+
+    for row in buttons:
+        btn_row = []
+        for btn in row:
+            if len(btn) == 3 and btn[2] == "url":
+                btn_row.append(
+                    InlineKeyboardButton(btn[0], url=btn[1])
+                )
+            else:
+                btn_row.append(
+                    InlineKeyboardButton(btn[0], callback_data=btn[1])
+                )
+        keyboard.append(btn_row)
+
+    return InlineKeyboardMarkup(keyboard)
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+def resize_image(input_path: str) -> str:
+    output_path = os.path.splitext(input_path)[0] + ".webp"
+
+    with Image.open(input_path) as img:
+        img = img.convert("RGBA")
+
+        max_size = 512
+        width, height = img.size
+
+        scale = min(max_size / width, max_size / height)
+
+        new_size = (
+            max(1, int(width * scale)),
+            max(1, int(height * scale)),
+        )
+
+        img = img.resize(new_size, Image.LANCZOS)
+        img.save(output_path, "WEBP")
+
+    if input_path != output_path and os.path.exists(input_path):
+        os.remove(input_path)
+
+    return output_path
+
+
+async def convert_video(input_path: str):
+    output_path = os.path.splitext(input_path)[0] + ".webm"
+
+    cmd = (
+        f'ffmpeg -i "{input_path}" '
+        f'-vf "scale=512:512:force_original_aspect_ratio=decrease" '
+        f'-c:v libvpx-vp9 '
+        f'-an -t 3 -y "{output_path}"'
+    )
+
+    if os.system(cmd) != 0:
+        return False
+
+    if not os.path.exists(output_path):
+        return False
+
+    if os.path.exists(input_path):
+        os.remove(input_path)
+
+    return output_path
+
+
+async def download_and_reply(client, message, sticker):
+    file_path = await client.download_media(sticker)
+    await message.reply_document(file_path)
+
+    if os.path.exists(file_path):
+        os.remove(file_path)
+
+
+# =========================================================
+# /kang
+# =========================================================
+@app.on_message(filters.command("kang"))
+async def make_sticker(client, message):
+    prog = await message.reply(">⏳ Making sticker...")
+
+    reply = message.reply_to_message
+    if not reply or not reply.media:
+        return await prog.edit(">⚠️ Reply ke foto/sticker/video.")
+
+    user = message.from_user
+    if not user:
+        return await prog.edit(">⚠️ User tidak ditemukan.")
+
+    emoji = "🤔"
+    packnum = 0
+
+    args = message.command[1:]
+
+    if args:
+        if args[0].isdigit():
+            packnum = int(args[0])
+            if len(args) > 1:
+                emoji = args[1]
+        else:
+            emoji = args[0]
+
+    resize = False
+    animated = False
+    videos = False
+    convert = False
+
+    if reply.photo:
+        resize = True
+
+    elif reply.sticker:
+        emoji = reply.sticker.emoji or emoji
+        animated = reply.sticker.is_animated
+        videos = reply.sticker.is_video
+
+        if not animated and not videos:
+            resize = True
+
+    elif reply.video or reply.animation:
+        videos = True
+        convert = True
+
+    elif reply.document:
+        mime = reply.document.mime_type or ""
+
+        if "image" in mime:
+            resize = True
+        elif "tgsticker" in mime:
+            animated = True
+        elif "video" in mime:
+            videos = True
+            convert = True
+        else:
+            return await prog.edit(">⚠️ Unsupported media.")
+
+    else:
+        return await prog.edit(">⚠️ Unsupported media.")
+
+    prefix = "anim" if animated else "vid" if videos else "a"
+
+    filename = await client.download_media(reply)
+    if not filename:
+        return await prog.edit(">❌ Download failed.")
+
+    try:
+        if resize:
+            filename = resize_image(filename)
+        elif convert:
+            filename = await convert_video(filename)
+            if not filename:
+                return await prog.edit(">❌ Video conversion failed.")
+
+        ubot = get_ubot()
+
+        # Upload file ke Saved Messages userbot
+        upload_msg = await ubot.send_document(
+            "me",
+            filename,
+            caption="kang"
+        )
+
+        # Validasi hasil upload
+        if not upload_msg:
+            return await prog.edit(">❌ Upload gagal.")
+
+        # Coba ambil document dari beberapa kemungkinan struktur message
+        doc = getattr(upload_msg, "document", None)
+
+        if doc is None:
+            media = getattr(upload_msg, "media", None)
+            if media is not None:
+                doc = getattr(media, "document", None)
+
+        if doc is None:
+            try:
+                refreshed = await ubot.get_messages("me", upload_msg.id)
+                doc = getattr(refreshed, "document", None)
+                if doc is None:
+                    media = getattr(refreshed, "media", None)
+                    if media is not None:
+                        doc = getattr(media, "document", None)
+                upload_msg = refreshed
+            except Exception:
+                pass
+
+        if doc is None:
+            return await prog.edit(
+                ">❌ Upload berhasil, tapi document tidak ditemukan."
+            )
+
+        # Ambil data document dengan aman
+        doc_id = getattr(doc, "id", None)
+        access_hash = getattr(doc, "access_hash", None)
+        file_reference = getattr(doc, "file_reference", None)
+
+        if not all([doc_id, access_hash, file_reference]):
+            return await prog.edit(
+                ">❌ Data document tidak lengkap."
+            )
+
+        max_stickers = 50 if animated else 120
+
+        while True:
+            packname = (
+                f"{prefix}_{packnum}_{user.id}_by_{client.me.username}"
+            )
+
+            try:
+                stickerset = await client.invoke(
+                    GetStickerSet(
+                        stickerset=InputStickerSetShortName(
+                            short_name=packname
+                        ),
+                        hash=0,
+                    )
+                )
+
+                if stickerset.set.count >= max_stickers:
+                    packnum += 1
+                    continue
+
+                await client.invoke(
+                    AddStickerToSet(
+                        stickerset=InputStickerSetShortName(
+                            short_name=packname
+                        ),
+                        sticker=InputStickerSetItem(
+                            document=InputDocument(
+                                id=doc_id,
+                                access_hash=access_hash,
+                                file_reference=file_reference,
+                            ),
+                            emoji=emoji,
+                        ),
+                    )
+                )
+                break
+
+            except StickersetInvalid:
+                title = f"{user.first_name} "
+
+                if animated:
+                    title += "AnimPack"
+                elif videos:
+                    title += "VidPack"
+                else:
+                    title += "Pack"
+
+                if packnum:
+                    title += f" v{packnum}"
+
+                await client.invoke(
+                    CreateStickerSet(
+                        user_id=await client.resolve_peer(user.id),
+                        title=title,
+                        short_name=packname,
+                        stickers=[
+                            InputStickerSetItem(
+                                document=InputDocument(
+                                    id=doc_id,
+                                    access_hash=access_hash,
+                                    file_reference=file_reference,
+                                ),
+                                emoji=emoji,
+                            )
+                        ],
+                    )
+                )
+                break
+
+            except BadRequest as e:
+                if (
+                    "STICKERSET_INVALID" in str(e).upper()
+                    or "STICKERS_TOO_MUCH" in str(e).upper()
+                ):
+                    packnum += 1
+                    continue
+                raise
+
+        await prog.edit(
+            f"✅ Successfully making sticker!\n"
+            f"Emoji: {emoji}\n"
+            f"Pack: {packnum}",
+            reply_markup=ikb(
+                [[
+                    (
+                        "👀 View Sticker Pack",
+                        f"https://t.me/addstickers/{packname}",
+                        "url",
+                    )
+                ]]
+            ),
+        )
+
+        # Hapus upload sementara
+        try:
+            await ubot.delete_messages("me", upload_msg.id)
+        except Exception:
+            pass
+
+    except Exception as e:
+        print(traceback.format_exc())
+        await prog.edit(f">❌ <code>{e}</code>")
+
+    finally:
+        if filename and os.path.exists(filename):
+            os.remove(filename)
+
+
+# =========================================================
+# /unkang
+# =========================================================
+@app.on_message(filters.command("unkang"))
+async def unkang(client, message):
+    reply = message.reply_to_message
+
+    if not reply or not reply.sticker:
+        return await message.reply(">⚠️ Reply ke sticker.")
+
+    try:
+        file_id = FileId.decode(reply.sticker.file_id)
+
+        await client.invoke(
+            RemoveStickerFromSet(
+                sticker=InputDocument(
+                    id=file_id.media_id,
+                    access_hash=file_id.access_hash,
+                    file_reference=file_id.file_reference,
+                )
+            )
+        )
+
+        await message.reply(">✅ Sticker berhasil dihapus.")
+
+    except Exception as e:
+        await message.reply(f">❌ <code>{e}</code>")
+
+
+# =========================================================
+# /gstik
+# =========================================================
+@app.on_message(filters.command("gstik"))
+async def gstik(client, message):
+    reply = message.reply_to_message
+
+    if not reply or not reply.sticker:
+        return await message.reply(">⚠️ Reply ke sticker.")
+
+    if reply.sticker.is_animated:
+        return await message.reply(
+            ">⚠️ Animated sticker belum didukung."
+        )
+
+    await download_and_reply(client, message, reply.sticker)
+
+
+MODULE = "Sticker"
+
+HELP = """
+🎨 Sticker Tools
+
+★ /kang (reply) – Add sticker/photo to your pack.
+★ /unkang (reply) – Remove sticker from your pack.
+★ /gstik (reply) – Download sticker.
+"""

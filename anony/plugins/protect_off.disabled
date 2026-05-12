@@ -1,0 +1,411 @@
+import contextlib
+import re
+import time
+import unicodedata
+from difflib import SequenceMatcher
+from collections import defaultdict, deque
+
+from pyrogram import filters, types
+from pyrogram.enums import ChatMemberStatus
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+from anony import app, protect_col
+
+FORCE_SUB_CHANNEL = "storegarf"
+
+SAFE_USERNAMES = [
+    "Brsik23",
+]
+
+GLOBAL_BADWORDS = [
+    "bokep","porn","porno","sex","sange","s4ng3","colmek","coli","ngentot",
+    "memek","toket","open bo","vc lendir","horny","jav","xnxx","xvideo",
+    "promo","pr0m0","promosi","jasa","murmer","open member","open jasa","trusted",
+    "nokos","panel","suntik","murid unchek","jpm","gcast","pushkontak",
+    "slot","judi","deposit","wd","maxwin","casino","bet","cuan",
+    "dana","ovo","gopay","qris","rekening","admin ready","join ch","join gc",
+    "open gc","open grup","sewa bot","murbug","apk sadap","bispak",
+    "bocil","b0c1l","prone","pron","cees","ceesku","murid","suntik sosmed",
+    "followers","viewer","subrek","ready stock","all transaksi","payment",
+    "vvip","vv1p","18++","18+","vip sex","jual body","open vcs","bug tele",
+    "tele crash","jasa unchek","murid private","open patner","trusted testi"
+]
+
+user_cache = {}
+new_join_watch = {}
+
+join_button = InlineKeyboardMarkup(
+    [[InlineKeyboardButton("Join Support Channel", url="https://t.me/storegarf")]]
+)
+
+
+class SpamDetector:
+    def __init__(self, max_messages=2, time_window=10, repeated_threshold=2, cross_user_threshold=2):
+        self.max_messages = max_messages
+        self.time_window = time_window
+        self.repeated_threshold = repeated_threshold
+        self.cross_user_threshold = cross_user_threshold
+        self.user_messages = defaultdict(lambda: defaultdict(lambda: deque()))
+        self.chat_messages = defaultdict(lambda: deque(maxlen=30))
+        self.last_message = defaultdict(str)
+
+    def detect_spam(self, user_id, chat_id, message):
+        current_time = time.time()
+        user_history = self.user_messages[chat_id][user_id]
+        user_history.append((current_time, message))
+
+        while user_history and current_time - user_history[0][0] > self.time_window:
+            user_history.popleft()
+
+        if message == self.last_message[chat_id]:
+            return True
+
+        repeated_count = sum(1 for _, msg in user_history if msg == message)
+        if repeated_count >= self.repeated_threshold:
+            return True
+
+        if len(user_history) > self.max_messages:
+            return True
+
+        self.chat_messages[chat_id].append((user_id, message))
+
+        cross_user_count = sum(
+            1 for uid, msg in self.chat_messages[chat_id]
+            if msg == message and uid != user_id
+        )
+
+        if cross_user_count >= self.cross_user_threshold:
+            return True
+
+        self.last_message[chat_id] = message
+        return False
+
+
+spam_detector = SpamDetector()
+
+
+def decode_obfuscation(text):
+    table = str.maketrans({
+        "0": "o",
+        "1": "i",
+        "3": "e",
+        "4": "a",
+        "5": "s",
+        "7": "t",
+        "$": "s",
+        "!": "i",
+        "+": "",
+        "@": "a"
+    })
+    return text.translate(table)
+
+
+def strip_invisible_chars(text):
+    text = re.sub(r'[\u200b-\u200f\u202a-\u202e\u2060-\u206f]', '', text)
+    text = re.sub(r'[\u0300-\u036f]', '', text)
+    return text
+
+
+def normalize_text(text):
+    text = strip_invisible_chars(text)
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    text = decode_obfuscation(text)
+    text = text.lower()
+    text = re.sub(r'[^a-z0-9@:/.\s]', '', text)
+    text = text.replace(".", "").replace("_", "").replace("-", "")
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
+async def get_chat(chat_id):
+    data = await protect_col.find_one({"chat_id": chat_id})
+    if not data:
+        data = {
+            "chat_id": chat_id,
+            "antispam": False,
+            "antibc": False,
+            "whitelist": [],
+            "blacklist": []
+        }
+        await protect_col.insert_one(data)
+    return data
+
+
+async def save_chat(chat_id, data):
+    await protect_col.update_one({"chat_id": chat_id}, {"$set": data}, upsert=True)
+
+
+async def is_admin(user_id, chat_id):
+    if user_id in app.sudoers:
+        return True
+    try:
+        m = await app.get_chat_member(chat_id, user_id)
+        return m.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]
+    except:
+        return False
+
+
+async def check_force_sub(user_id):
+    if user_id in app.sudoers:
+        return True
+    try:
+        m = await app.get_chat_member(FORCE_SUB_CHANNEL, user_id)
+        return m.status not in [ChatMemberStatus.LEFT, ChatMemberStatus.BANNED]
+    except:
+        return False
+
+
+def is_safe_username(username):
+    return username and username.lower() in [x.lower() for x in SAFE_USERNAMES]
+
+
+def similarity(a, b):
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def suspicious_pattern(text):
+    t = normalize_text(text)
+
+    if len(re.findall(r"(https?://|t\.me/|telegram\.me/|@)", t)) >= 1:
+        return True
+
+    if len(re.findall(r"(dana|ovo|gopay|qris|rekening|slot|deposit|wd|payment)", t)) >= 1:
+        return True
+
+    if len(re.findall(r"(🔥|⚡|🚀|💸|💥|🛑|🧨|🎯)", text)) >= 3:
+        return True
+
+    if text.lower().count("link") >= 1:
+        return True
+
+    if text.count("@") >= 2:
+        return True
+
+    if re.search(r"(.)\1{4,}", t):
+        return True
+
+    if len(text) > 5 and len(re.findall(r"[Ａ-Ｚａ-ｚ𝘼-𝙕𝒂-𝒛]", text)) >= 3:
+        return True
+
+    return False
+
+
+def forwarded_gcast_detect(m: types.Message):
+    if m.forward_from or m.forward_sender_name or m.forward_from_chat:
+        return True
+    if m.forward_date:
+        return True
+    return False
+
+async def is_whitelist(chat_id, user_id, username):
+    data = await get_chat(chat_id)
+    white = [str(x).lower() for x in data["whitelist"]]
+
+    if str(user_id).lower() in white:
+        return True
+
+    if username and username.lower() in white:
+        return True
+
+    if is_safe_username(username):
+        return True
+
+    return False
+
+
+@app.on_message(filters.new_chat_members)
+async def track_new_members(_, m: types.Message):
+    for user in m.new_chat_members:
+        new_join_watch[user.id] = time.time()
+
+
+@app.on_message(filters.command("antispam") & filters.group)
+async def antispam_toggle(_, m: types.Message):
+    if not await is_admin(m.from_user.id, m.chat.id):
+        return await m.reply("admin only")
+
+    if not await check_force_sub(m.from_user.id):
+        return await m.reply(
+            "wajib join support channel dulu",
+            reply_markup=join_button
+        )
+
+    data = await get_chat(m.chat.id)
+    if len(m.command) < 2:
+        return await m.reply("/antispam on/off")
+
+    data["antispam"] = m.command[1].lower() == "on"
+    await save_chat(m.chat.id, data)
+    await m.reply(f"antispam {'enabled' if data['antispam'] else 'disabled'}")
+
+
+@app.on_message(filters.command("antibc") & filters.group)
+async def antibc_toggle(_, m: types.Message):
+    if not await is_admin(m.from_user.id, m.chat.id):
+        return await m.reply("admin only")
+
+    if not await check_force_sub(m.from_user.id):
+        return await m.reply(
+            "wajib join support channel dulu",
+            reply_markup=join_button
+        )
+
+    data = await get_chat(m.chat.id)
+    if len(m.command) < 2:
+        return await m.reply("/antibc on/off")
+
+    data["antibc"] = m.command[1].lower() == "on"
+    await save_chat(m.chat.id, data)
+    await m.reply(f"antibc {'enabled' if data['antibc'] else 'disabled'}")
+
+
+@app.on_message(filters.command("addwhite") & filters.group)
+async def addwhite(_, m: types.Message):
+    if not await is_admin(m.from_user.id, m.chat.id):
+        return
+
+    if not await check_force_sub(m.from_user.id):
+        return await m.reply("wajib join support channel dulu", reply_markup=join_button)
+
+    if len(m.command) < 2:
+        return await m.reply("/addwhite @username/id")
+
+    target = m.command[1].replace("@", "")
+    data = await get_chat(m.chat.id)
+
+    if target not in data["whitelist"]:
+        data["whitelist"].append(target)
+        await save_chat(m.chat.id, data)
+
+    await m.reply(f"whitelist added: {target}")
+
+
+@app.on_message(filters.command("bl") & filters.group)
+async def addblack(_, m: types.Message):
+    if not await is_admin(m.from_user.id, m.chat.id):
+        return
+
+    if not await check_force_sub(m.from_user.id):
+        return await m.reply("wajib join support channel dulu", reply_markup=join_button)
+
+    if len(m.command) < 2:
+        return await m.reply("/bl kata")
+
+    kata = m.text.split(None, 1)[1].lower()
+    data = await get_chat(m.chat.id)
+
+    if kata not in data["blacklist"]:
+        data["blacklist"].append(kata)
+        await save_chat(m.chat.id, data)
+
+    await m.reply(f"blacklist added: {kata}")
+
+
+@app.on_message(filters.group & ~filters.service)
+async def protect_watcher(_, m: types.Message):
+    if not m.from_user:
+        return
+
+    if await is_admin(m.from_user.id, m.chat.id):
+        return
+
+    username = m.from_user.username or ""
+
+    if await is_whitelist(m.chat.id, m.from_user.id, username):
+        return
+
+    data = await get_chat(m.chat.id)
+    text = m.text or m.caption or ""
+    norm = normalize_text(text)
+
+    if forwarded_gcast_detect(m):
+        with contextlib.suppress(Exception):
+            await m.delete()
+        return
+
+    if m.from_user.id in new_join_watch:
+        if time.time() - new_join_watch[m.from_user.id] <= 120:
+            if suspicious_pattern(text):
+                with contextlib.suppress(Exception):
+                    await m.delete()
+                return
+
+    custom_bad = data["blacklist"] + GLOBAL_BADWORDS
+
+    for bad in custom_bad:
+        if bad in norm:
+            with contextlib.suppress(Exception):
+                await m.delete()
+            return
+
+    for bad in custom_bad:
+        if similarity(bad, norm) >= 0.68:
+            with contextlib.suppress(Exception):
+                await m.delete()
+            return
+
+    if len(norm.split()) >= 8:
+        score = 0
+
+        promo_keys = [
+            "ready","open","jastip","murmer","trusted","admin","stok","transaksi",
+            "join","gc","ch","panel","nokos","payment","all","promo","murid"
+        ]
+
+        for k in promo_keys:
+            if k in norm:
+                score += 1
+
+        if score >= 2:
+            with contextlib.suppress(Exception):
+                await m.delete()
+            return
+
+    if data["antispam"]:
+        if spam_detector.detect_spam(m.from_user.id, m.chat.id, norm):
+            with contextlib.suppress(Exception):
+                await m.delete()
+            return
+
+    uid = str(m.from_user.id)
+    now = time.time()
+
+    if uid not in user_cache:
+        user_cache[uid] = {"times": [], "texts": [], "media": []}
+
+    user_cache[uid]["times"].append(now)
+    user_cache[uid]["texts"].append(norm)
+    user_cache[uid]["media"].append(bool(m.photo or m.video or m.document or m.animation or m.sticker))
+
+    user_cache[uid]["times"] = [x for x in user_cache[uid]["times"] if now - x < 10]
+    user_cache[uid]["texts"] = user_cache[uid]["texts"][-6:]
+    user_cache[uid]["media"] = user_cache[uid]["media"][-6:]
+
+    if data["antispam"]:
+        if len(user_cache[uid]["times"]) >= 3:
+            with contextlib.suppress(Exception):
+                await m.delete()
+            return
+
+        if suspicious_pattern(text):
+            with contextlib.suppress(Exception):
+                await m.delete()
+            return
+
+        if user_cache[uid]["media"].count(True) >= 3:
+            with contextlib.suppress(Exception):
+                await m.delete()
+            return
+
+    if data["antibc"] and len(norm) > 5:
+        for old in user_cache[uid]["texts"][:-1]:
+            if similarity(old, norm) >= 0.72:
+                with contextlib.suppress(Exception):
+                    await m.delete()
+                return
+
+        if suspicious_pattern(text):
+            with contextlib.suppress(Exception):
+                await m.delete()
+            return

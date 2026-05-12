@@ -1,0 +1,804 @@
+import asyncio
+import aiohttp
+import difflib
+import re
+import time
+import unicodedata
+
+from collections import defaultdict, deque
+
+from pyrogram import filters
+from pyrogram.enums import ChatMemberStatus
+from pyrogram.types import Message
+
+from anony import app, db, config
+
+
+# =========================================================
+# OPTIONAL MODULES
+# =========================================================
+
+try:
+    from Levenshtein import distance as levenshtein_distance
+except Exception:
+    levenshtein_distance = None
+
+try:
+    from unidecode import unidecode
+except Exception:
+    def unidecode(x):
+        return x
+
+
+# =========================================================
+# CONFIG
+# =========================================================
+
+OWNER_ID = getattr(config, "OWNER_ID", 0)
+SUDO_USERS = getattr(config, "SUDO_USERS", []) or []
+
+MAILYAN_API_KEY = getattr(
+    config,
+    "MAILYAN_API_KEY_ANTIBC",
+    getattr(config, "MAELYN_KEY", None)
+)
+
+MAILYAN_API_URL = "https://api.mailyan.ai/v1/chat/completions"
+
+# Score threshold (langsung hapus jika skor >= 3)
+SCORE_THRESHOLD = 3
+
+# Jalankan Mailyan AI jika skor minimal 1
+AI_MIN_SCORE = 1
+
+# Spam behavior
+REPEAT_LIMIT = 3
+REPEAT_WINDOW = 120
+
+FORWARD_LIMIT = 3
+FORWARD_WINDOW = 60
+
+SIMILAR_LIMIT = 4
+SIMILAR_WINDOW = 180
+
+CROSS_GROUP_LIMIT = 4
+CROSS_GROUP_WINDOW = 180
+
+
+# =========================================================
+# CACHE
+# =========================================================
+
+# Riwayat pesan user
+USER_MESSAGE_CACHE = defaultdict(lambda: deque(maxlen=50))
+
+# Riwayat forward user
+USER_FORWARD_CACHE = defaultdict(lambda: deque(maxlen=30))
+
+# Riwayat broadcast lintas grup
+USER_CROSS_CACHE = defaultdict(lambda: deque(maxlen=100))
+
+# Pesan terakhir per grup
+LAST_CHAT_MESSAGE = {}
+
+# Anti flood kirim terlalu cepat
+USER_FAST_CACHE = defaultdict(lambda: deque(maxlen=20))
+
+# Lock per user
+LOCKS = defaultdict(asyncio.Lock)
+
+
+# =========================================================
+# FAST MESSAGE CONFIG
+# =========================================================
+
+# Jika user kirim 6 pesan dalam 10 detik -> hapus
+FAST_MESSAGE_LIMIT = 6
+FAST_MESSAGE_WINDOW = 10
+
+# =========================================================
+# NORMALIZATION
+# =========================================================
+
+REPLACE_MAP = {
+    "0": "o",
+    "1": "i",
+    "2": "z",
+    "3": "e",
+    "4": "a",
+    "5": "s",
+    "6": "g",
+    "7": "t",
+    "8": "b",
+    "9": "g",
+    "@": "a",
+    "$": "s",
+    "!": "i",
+    "|": "i",
+}
+
+# Keyword ranah 18+ & promosi
+BAD_KEYWORDS = [
+    # seksual
+    "bokep",
+    "bocil",
+    "sange",
+    "horny",
+    "ngentot",
+    "memek",
+    "kontol",
+    "toket",
+    "tetek",
+    "coli",
+    "crot",
+    "vcs",
+    "open vcs",
+    "open bo",
+    "onlyfans",
+    "omek",
+    "biyoh",
+    "dibiyoh",
+    "mdia",
+    "media",
+    "full video",
+    "full vid",
+    "koleksi pribadi",
+    "pf aku",
+    "di bio",
+
+    # promosi
+    "vip",
+    "premium",
+    "murah",
+    "promo",
+    "promosi",
+    "diskon",
+    "fresh media",
+    "freshmedia",
+    "join grup",
+    "join group",
+    "join gc",
+    "klik link",
+    "cek bio",
+    "pc aku",
+    "dm aku",
+    "chat aku",
+]
+
+REGEX_PATTERNS = [
+    r"v[i1!|]p",
+    r"b[o0]k[e3]p",
+    r"onlyf[a4]ns?",
+    r"v[c(]s",
+    r"open\s*vcs",
+    r"open\s*bo",
+    r"m[d4]i[a4]",
+    r"b[i1]y[o0]h",
+    r"dm\s*a[kq]u",
+    r"pc\s*a[kq]u",
+    r"chat\s*a[kq]u",
+    r"cek\s*bio",
+    r"pf\s*a[kq]u",
+]
+
+
+# =========================================================
+# TEXT HELPERS
+# =========================================================
+
+def remove_invisible(text: str) -> str:
+    return "".join(
+        c for c in (text or "")
+        if unicodedata.category(c)[0] != "C"
+    )
+
+
+def normalize_text(text: str) -> str:
+    text = remove_invisible(text)
+    text = unicodedata.normalize("NFKD", text).lower()
+    text = unidecode(text)
+
+    for old, new in REPLACE_MAP.items():
+        text = text.replace(old, new)
+
+    # kurangi huruf berulang
+    text = re.sub(r"(.)\1{2,}", r"\1", text)
+
+    # hapus simbol
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+
+    # rapikan spasi
+    text = re.sub(r"\s+", " ", text).strip()
+
+    return text
+
+
+def compact_text(text: str) -> str:
+    return re.sub(r"\s+", "", normalize_text(text))
+
+
+def similarity(a: str, b: str) -> float:
+    if levenshtein_distance:
+        max_len = max(len(a), len(b))
+        if max_len == 0:
+            return 1.0
+        return 1 - (levenshtein_distance(a, b) / max_len)
+
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+# =========================================================
+# DATABASE HELPERS
+# =========================================================
+
+async def set_antibc(chat_id: int, status: bool):
+    await db.cache.update_one(
+        {"_id": f"antibc:{chat_id}"},
+        {"$set": {"status": status}},
+        upsert=True
+    )
+
+
+async def get_antibc(chat_id: int) -> bool:
+    data = await db.cache.find_one({"_id": f"antibc:{chat_id}"})
+    return bool(data and data.get("status"))
+
+
+# =========================================================
+# WHITELIST
+# =========================================================
+
+async def is_whitelisted(user_id: int) -> bool:
+    if user_id == OWNER_ID:
+        return True
+
+    if user_id in SUDO_USERS:
+        return True
+
+    return False
+
+
+# =========================================================
+# ADMIN CHECK
+# =========================================================
+
+async def is_admin(chat_id: int, user_id: int) -> bool:
+    if await is_whitelisted(user_id):
+        return True
+
+    try:
+        member = await app.get_chat_member(chat_id, user_id)
+        return member.status in (
+            ChatMemberStatus.OWNER,
+            ChatMemberStatus.ADMINISTRATOR,
+        )
+    except Exception:
+        return False
+
+
+# =========================================================
+# SCORE DETECTION
+# =========================================================
+
+def suspicious_score(text: str) -> int:
+    if not text:
+        return 0
+
+    score = 0
+    normalized = normalize_text(text)
+    compact = compact_text(text)
+
+    # ==========================================
+    # KEYWORD DASAR
+    # ==========================================
+    hits = 0
+    for kw in BAD_KEYWORDS:
+        if compact_text(kw) in compact:
+            hits += 1
+
+    score += hits
+
+    # ==========================================
+    # REGEX PATTERNS
+    # ==========================================
+    for pattern in REGEX_PATTERNS:
+        if re.search(pattern, normalized):
+            score += 1
+
+    # ==========================================
+    # FRASE SEKSUAL TERSELUBUNG
+    # ==========================================
+    sexual_phrases = [
+        "byoh",
+        "biyoh",
+        "dibiyoh",
+        "dibiyohh",
+        "di biyoh",
+        "ke byoh",
+        "kebiyoh",
+        "kebyoh",
+        "dbyo",
+        "dbyoh",
+        "dbiyoh",
+        "omegg",
+        "callsex",
+        "ometv",
+        "crott",
+        "cro00t",
+        "crot",
+        "sampe crot",
+        "sampai crot",
+        "emut",
+        "emutt",
+        "di emut",
+        "mainin",
+        "maininn",
+        "di mainin",
+        "manjain kamu",
+        "liatin ya",
+        "liatin yuk",
+        "liatin yug",
+        "liatin",
+        "pacaran yuk",
+        "pacaran yug",
+        "ngocok",
+        "coli",
+        "horny",
+        "sange",
+    ]
+
+    for phrase in sexual_phrases:
+        if compact_text(phrase) in compact:
+            score += 2
+
+    # ==========================================
+    # KOMBINASI KATA MENCURIGAKAN
+    # ==========================================
+    combo_words = [
+        "yuk",
+        "yug",
+        "hehe",
+        "liatin",
+        "manjain",
+        "pacaran",
+        "omegg",
+        "byoh",
+        "biyoh",
+        "dbyo",
+        "dbyoh",
+        "crot",
+        "emut",
+        "mainin",
+    ]
+
+    combo_count = 0
+    for word in combo_words:
+        if compact_text(word) in compact:
+            combo_count += 1
+
+    if combo_count >= 2:
+        score += 3
+
+    # ==========================================
+    # LINK
+    # ==========================================
+    if re.search(r"(https?://|t\.me/|telegram\.me|wa\.me)", text.lower()):
+        score += 2
+
+    # ==========================================
+    # USERNAME / MENTION
+    # ==========================================
+    if re.search(r"@\w{4,}", text):
+        score += 1
+
+    # ==========================================
+    # PESAN PANJANG + KEYWORD
+    # ==========================================
+    if len(compact) > 50 and score >= 1:
+        score += 1
+
+    # ==========================================
+    # DEBUG
+    # ==========================================
+    print(f"[ANTIBC] suspicious_score => {score}")
+
+    return score
+
+
+
+# =========================================================
+# AI DETECTION (MAILYAN)
+# =========================================================
+
+async def mailyan_detect(text: str) -> bool:
+    if not MAILYAN_API_KEY or not text:
+        return False
+
+    payload = {
+        "model": "gpt-4.1-mini",
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Kamu adalah AI anti spam Telegram. "
+                    "Jawab hanya 'SPAM' jika pesan mengandung "
+                    "promosi, iklan, broadcast, seksual, konten dewasa, "
+                    "ajakan DM, ajakan cek bio, atau penawaran media. "
+                    "Jawab hanya 'HAM' jika pesan normal."
+                )
+            },
+            {
+                "role": "user",
+                "content": text[:3000]
+            }
+        ],
+        "temperature": 0,
+        "max_tokens": 5
+    }
+
+    headers = {
+        "Authorization": f"Bearer {MAILYAN_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                MAILYAN_API_URL,
+                headers=headers,
+                json=payload
+            ) as resp:
+                if resp.status != 200:
+                    return False
+
+                data = await resp.json()
+
+                result = (
+                    data.get("choices", [{}])[0]
+                    .get("message", {})
+                    .get("content", "")
+                    .strip()
+                    .upper()
+                )
+
+                return "SPAM" in result
+
+    except Exception:
+        return False
+
+
+# =========================================================
+# ACTION
+# =========================================================
+
+async def punish_user(message: Message, reason: str):
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    try:
+        warn = await app.send_message(
+            message.chat.id,
+            f"⚠️ Spam terdeteksi dan dihapus.\nReason: {reason}"
+        )
+        await asyncio.sleep(4)
+        await warn.delete()
+    except Exception:
+        pass
+
+
+# =========================================================
+# COMMAND
+# =========================================================
+
+@app.on_message(filters.command("antibc") & filters.group)
+async def antibc_toggle(_, message: Message):
+    if not message.from_user:
+        return
+
+    if not await is_admin(message.chat.id, message.from_user.id):
+        return
+
+    if len(message.command) < 2:
+        return await message.reply_text(
+            "Gunakan:\n/antibc on\n/antibc off"
+        )
+
+    arg = message.command[1].lower()
+
+    if arg == "on":
+        await set_antibc(message.chat.id, True)
+        await message.reply_text("✅ AntiBroadcast aktif.")
+
+    elif arg == "off":
+        await set_antibc(message.chat.id, False)
+        await message.reply_text("✅ AntiBroadcast nonaktif.")
+
+
+async def get_antibc(chat_id: int) -> bool:
+    data = await db.cache.find_one({"_id": f"antibc:{chat_id}"})
+    return bool(data and data.get("status"))
+
+
+# TARUH FUNGSI INI DI SINI
+async def ankes_active(chat_id: int) -> bool:
+    try:
+        if hasattr(db, "is_ankes"):
+            status = await db.is_ankes(chat_id)
+            if not status:
+                return False
+
+        if hasattr(db, "get_expired"):
+            expired = await db.get_expired(chat_id)
+
+            if expired and int(time.time()) > int(expired):
+                if hasattr(db, "remove_ankes"):
+                    await db.remove_ankes(chat_id)
+                return False
+
+        return True
+
+    except Exception as e:
+        print(f"[ANTIBC] ankes_active error: {e}")
+        return True
+
+
+# =========================================================
+async def get_antibc(chat_id: int) -> bool:
+    data = await db.cache.find_one({"_id": f"antibc:{chat_id}"})
+    return bool(data and data.get("status"))
+
+
+# TARUH FUNGSI INI DI SINI
+async def ankes_active(chat_id: int) -> bool:
+    try:
+        if hasattr(db, "is_ankes"):
+            status = await db.is_ankes(chat_id)
+            if not status:
+                return False
+
+        if hasattr(db, "get_expired"):
+            expired = await db.get_expired(chat_id)
+
+            if expired and int(time.time()) > int(expired):
+                if hasattr(db, "remove_ankes"):
+                    await db.remove_ankes(chat_id)
+                return False
+
+        return True
+
+    except Exception as e:
+        print(f"[ANTIBC] ankes_active error: {e}")
+        return True
+
+# =========================================================
+# MAIN DETECTOR
+# =========================================================
+@app.on_message(filters.group & ~filters.service, group=-2)
+async def antibroadcast_main(_, message: Message):
+    try:
+        if not message or not message.from_user:
+            return
+
+        chat_id = message.chat.id
+        user_id = message.from_user.id
+
+        # DEBUG
+        print(f"[ANTIBC] New message from {user_id} in {chat_id}")
+
+        # antibc harus aktif
+        enabled = await get_antibc(chat_id)
+        print(f"[ANTIBC] Enabled: {enabled}")
+        if not enabled:
+            return
+
+        # cek ankes aktif
+        if not await ankes_active(chat_id):
+            print("[ANTIBC] Ankes inactive")
+            return
+
+        # skip admin / owner / whitelist
+        admin = await is_admin(chat_id, user_id)
+        print(f"[ANTIBC] Is admin: {admin}")
+        if admin:
+            return
+
+        # =====================================================
+        # AMBIL SEMUA TEKS:
+        # - pesan
+        # - caption
+        # - first name
+        # - last name
+        # - username
+        # - bio/about Telegram
+        # =====================================================
+        text_parts = []
+
+        if message.text:
+            text_parts.append(message.text)
+
+        if message.caption:
+            text_parts.append(message.caption)
+
+        if message.from_user.first_name:
+            text_parts.append(message.from_user.first_name)
+
+        if message.from_user.last_name:
+            text_parts.append(message.from_user.last_name)
+
+        if message.from_user.username:
+            text_parts.append(message.from_user.username)
+
+        # Ambil bio Telegram user
+        try:
+            full_user = await app.get_users(user_id)
+
+            if getattr(full_user, "bio", None):
+                text_parts.append(full_user.bio)
+
+            elif getattr(full_user, "about", None):
+                text_parts.append(full_user.about)
+
+        except Exception:
+            pass
+
+        # Gabungkan semua text
+        text_raw = "\n".join(
+            str(x) for x in text_parts if x
+        ).strip()
+
+        print(f"[ANTIBC] Full text: {text_raw}")
+
+        # Jika tidak ada text dan bukan forward
+        if not text_raw and not message.forward_date:
+            return
+
+        compact = compact_text(text_raw)
+
+        if text_raw and len(compact) < 3:
+            return
+
+        now = time.time()
+        user_key = str(user_id)
+
+        # =====================================================
+        # SCORE DETECTION
+        # =====================================================
+        score = suspicious_score(text_raw)
+
+        if message.forward_date:
+            score += 3
+
+        print(f"[ANTIBC] Score: {score}")
+
+        # LANGSUNG HAPUS JIKA SCORE >= SCORE_THRESHOLD
+        if score >= SCORE_THRESHOLD:
+            print("[ANTIBC] DELETE BY SCORE")
+            await punish_user(
+                message,
+                f"Score Detection ({score})"
+            )
+            return
+
+        # =====================================================
+        # AI DETECTION (Mailyan)
+        # =====================================================
+        if score >= AI_MIN_SCORE:
+            print("[ANTIBC] Checking Mailyan AI...")
+
+            if await mailyan_detect(text_raw):
+                print("[ANTIBC] DELETE BY AI")
+                await punish_user(
+                    message,
+                    f"Mailyan AI Detection ({score})"
+                )
+                return
+
+        # =====================================================
+        # CACHE CHECKS
+        # =====================================================
+        async with LOCKS[user_key]:
+
+            # Exact repeat
+            cache = USER_MESSAGE_CACHE[user_key]
+            cache.append({
+                "text": compact,
+                "time": now,
+                "chat": chat_id,
+            })
+
+            same_count = sum(
+                1
+                for x in cache
+                if x["text"] == compact
+                and now - x["time"] <= REPEAT_WINDOW
+            )
+
+            if same_count >= REPEAT_LIMIT:
+                print("[ANTIBC] DELETE BY REPEAT")
+                await punish_user(
+                    message,
+                    "Repeated broadcast"
+                )
+                return
+
+            # Similar spam
+            similar_count = 0
+
+            for x in cache:
+                if now - x["time"] > SIMILAR_WINDOW:
+                    continue
+
+                if similarity(x["text"], compact) >= 0.80:
+                    similar_count += 1
+
+            if similar_count >= SIMILAR_LIMIT:
+                print("[ANTIBC] DELETE BY SIMILAR")
+                await punish_user(
+                    message,
+                    "Similar broadcast spam"
+                )
+                return
+
+            # Cross-group broadcast
+            cross = USER_CROSS_CACHE[user_key]
+            cross.append({
+                "text": compact,
+                "chat": chat_id,
+                "time": now,
+            })
+
+            groups = set()
+
+            for x in cross:
+                if now - x["time"] > CROSS_GROUP_WINDOW:
+                    continue
+
+                if similarity(x["text"], compact) >= 0.80:
+                    groups.add(x["chat"])
+
+            if len(groups) >= CROSS_GROUP_LIMIT:
+                print("[ANTIBC] DELETE BY CROSS GROUP")
+                await punish_user(
+                    message,
+                    "Cross-group broadcast"
+                )
+                return
+
+            # Forward flood
+            if message.forward_date:
+                fw = USER_FORWARD_CACHE[user_key]
+                fw.append(now)
+
+                recent_fw = sum(
+                    1
+                    for ts in fw
+                    if now - ts <= FORWARD_WINDOW
+                )
+
+                if recent_fw >= FORWARD_LIMIT:
+                    print("[ANTIBC] DELETE BY FORWARD FLOOD")
+                    await punish_user(
+                        message,
+                        "Forward flood"
+                    )
+                    return
+
+            # Duplicate in same group
+            last_key = str(chat_id)
+
+            if LAST_CHAT_MESSAGE.get(last_key) == compact:
+                print("[ANTIBC] DELETE BY DUPLICATE")
+                await punish_user(
+                    message,
+                    "Duplicate chat spam"
+                )
+                return
+
+            LAST_CHAT_MESSAGE[last_key] = compact
+
+    except Exception as e:
+        print(f"ANTIBC ERROR: {e}")

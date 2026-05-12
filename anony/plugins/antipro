@@ -1,0 +1,1042 @@
+# anony/plugins/antibc.py
+
+import re
+import time
+import asyncio
+import unicodedata
+import difflib
+
+from collections import defaultdict, deque
+
+from pyrogram import filters
+from pyrogram.types import Message, ChatPermissions
+from pyrogram.enums import ChatMemberStatus
+from pyrogram.errors import RPCError
+
+from anony import app, db, config
+
+# =========================================================
+# OPTIONAL MODULES
+# =========================================================
+
+try:
+    from Levenshtein import distance as levenshtein_distance
+except:
+    levenshtein_distance = None
+
+try:
+    from metaphone import doublemetaphone
+except:
+    doublemetaphone = None
+
+try:
+    from nltk.util import ngrams
+except:
+    ngrams = None
+
+try:
+    from unidecode import unidecode
+except:
+    def unidecode(x):
+        return x
+
+
+# =========================================================
+# CACHE
+# =========================================================
+
+BROADCAST_CACHE = defaultdict(lambda: deque(maxlen=50))
+FORWARD_CACHE = defaultdict(lambda: deque(maxlen=30))
+CROSS_CHAT_CACHE = defaultdict(lambda: deque(maxlen=100))
+LAST_MESSAGE = defaultdict(str)
+
+ANTIBC_LOCK = defaultdict(asyncio.Lock)
+
+SUSPICIOUS_WORDS = [
+    "join",
+    "gc",
+    "asupan",
+    "murah",
+    "admin",
+    "promosi",
+    "open",
+    "vvip",
+    "fwbeh",
+    "free",
+    "omek",
+    "v1p",
+    "v1p murah",
+    "bokep",
+    "cari cwk",
+    "cari cwe",
+    "horny",
+    "open vcs",
+    "open bo",
+]
+
+
+# =========================================================
+# SETTINGS
+# =========================================================
+
+BC_REPEAT_LIMIT = 3        # pesan sama 3x
+BC_REPEAT_TIME = 120       # dalam 2 menit
+
+BC_FORWARD_LIMIT = 3       # forward 3x
+BC_FORWARD_TIME = 60
+
+BC_SIMILAR_LIMIT = 4
+BC_SIMILAR_TIME = 180
+
+BC_CROSSCHAT_LIMIT = 4
+
+OWNER = config.OWNER_ID
+
+SUDO = []
+try:
+    if isinstance(config.SUDO_USERS, list):
+        SUDO = config.SUDO_USERS
+except:
+    pass
+
+
+# =========================================================
+# NORMALIZER
+# =========================================================
+
+def remove_invisible(text: str) -> str:
+    return "".join(
+        c for c in text
+        if unicodedata.category(c)[0] != "C"
+    )
+
+
+def normalize_text(text: str) -> str:
+    text = text.lower()
+    text = unicodedata.normalize("NFKD", text)
+
+    replace_map = {
+        "0": "o",
+        "1": "i",
+        "2": "z",
+        "3": "e",
+        "4": "a",
+        "5": "s",
+        "6": "g",
+        "7": "t",
+        "8": "b",
+        "9": "g",
+        "@": "a",
+        "$": "s",
+        "!": "i",
+        "|": "i",
+    }
+
+    for old, new in replace_map.items():
+        text = text.replace(old, new)
+
+    # huruf berulang
+    text = re.sub(r"(.)\1{2,}", r"\1", text)
+
+    # hapus simbol
+    text = re.sub(r"[^a-zA-Z0-9\s]", "", text)
+
+    # rapikan spasi
+    text = re.sub(r"\s+", " ", text)
+
+    return text.strip()
+
+
+def compact_text(text: str) -> str:
+    return re.sub(r"\s+", "", text.lower())
+
+
+# =========================================================
+# EXTRA AGGRESSIVE DETECTION
+# Ganti fungsi suspicious_score() lama dengan versi ini
+# =========================================================
+
+def suspicious_score(text: str) -> int:
+    """
+    Detector super agresif.
+    Menangkap:
+    - l33t text (v1p, b0cil, m3dia)
+    - huruf dipisah spasi/simbol
+    - kata promosi
+    - ajakan DM/PC
+    - teks terlalu banyak keyword
+    """
+
+    if not text:
+        return 0
+
+    score = 0
+
+    # -----------------------------------------
+    # RAW
+    # -----------------------------------------
+    raw = remove_invisible(text)
+    lowered = raw.lower()
+
+    # -----------------------------------------
+    # NORMALIZED
+    # -----------------------------------------
+    normalized = normalize_text(raw)
+    compact = compact_text(normalized)
+
+    # -----------------------------------------
+    # KEYWORDS SUPER LENGKAP
+    # -----------------------------------------
+    keywords = [
+        # vip / media
+        "vip", "v1p", "vvip", "premium",
+        "media", "fresh", "new",
+
+        # jualan
+        "murah", "termurah", "promo", "promosi",
+        "diskon", "best price", "ready", "stok",
+        "available",
+
+        # grup
+        "join", "gc", "group", "grup",
+        "admin", "owner", "reseller",
+
+        # konten
+        "asupan", "bokep", "onlyfans", "onlyf4ns",
+        "of", "ngewe", "ngentot", "sange",
+        "horny", "open bo", "open vcs",
+        "vcs", "vcs murah", "omek",
+        "live", "video call", "call sex",
+
+        # ajakan
+        "pc aku", "dm aku", "chat aku",
+        "sini pc", "sini dm", "langsung gas",
+        "klik link", "cek bio", "rate",
+
+        # variasi umum
+        "biyoh", "dibiyoh", "di biyoh",
+        "full vid", "full video",
+        "private", "private room",
+    ]
+
+    # -----------------------------------------
+    # HITUNG KEYWORD DI NORMALIZED + COMPACT
+    # -----------------------------------------
+    for word in keywords:
+        w = compact_text(normalize_text(word))
+
+        if w in compact:
+            score += 2
+
+        elif word.lower() in lowered:
+            score += 2
+
+    # -----------------------------------------
+    # REGEX PATTERNS
+    # -----------------------------------------
+    patterns = [
+        r"v[i1!|]p",
+        r"m[u4]r[a4]h",
+        r"b[o0]k[e3]p",
+        r"b[o0]c[i1]l",
+        r"o[mn]e[kx]",
+        r"v[c(]s",
+        r"onlyf[a4]ns?",
+        r"fresh",
+        r"full\s*v[i1]d",
+        r"pc\s*a[kq]u",
+        r"dm\s*a[kq]u",
+        r"chat\s*a[kq]u",
+        r"sini\s*(pc|dm)",
+        r"langsung\s*gas",
+        r"klik\s*link",
+        r"cari\s*(cwk|cwe)",
+        r"join\s*(gc|group|grup)",
+    ]
+
+    for pattern in patterns:
+        if re.search(pattern, compact):
+            score += 3
+
+    # -----------------------------------------
+    # HURUF BERLEBIHAN
+    # contoh: muraaaahhhh
+    # -----------------------------------------
+    if re.search(r"(.)\1{3,}", lowered):
+        score += 2
+
+    # -----------------------------------------
+    # BANYAK ANGKA (l33t)
+    # -----------------------------------------
+    digit_count = sum(c.isdigit() for c in raw)
+    if digit_count >= 3:
+        score += 2
+
+    if digit_count >= 6:
+        score += 2
+
+    # -----------------------------------------
+    # BANYAK SIMBOL
+    # -----------------------------------------
+    symbol_count = len(re.findall(r"[^a-zA-Z0-9\s]", raw))
+    if symbol_count >= 5:
+        score += 1
+
+    if symbol_count >= 10:
+        score += 2
+
+    # -----------------------------------------
+    # URL / LINK
+    # -----------------------------------------
+    if re.search(r"(https?://|t\.me/|telegram\.me|wa\.me)", lowered):
+        score += 5
+
+    # -----------------------------------------
+    # USERNAME TELEGRAM
+    # -----------------------------------------
+    if re.search(r"@\w{4,}", raw):
+        score += 2
+
+    # -----------------------------------------
+    # AJAKAN KONTAK
+    # -----------------------------------------
+    contact_phrases = [
+        "pc aku",
+        "dm aku",
+        "tmo",
+        "kolcek",
+        "sini",
+        "becek",
+        "cekin",
+        "rate",
+    ]
+
+    for phrase in contact_phrases:
+        if compact_text(normalize_text(phrase)) in compact:
+            score += 2
+
+    # -----------------------------------------
+    # BANYAK KEYWORD SEKALIGUS
+    # -----------------------------------------
+    hit_count = 0
+    for word in keywords:
+        w = compact_text(normalize_text(word))
+        if w in compact:
+            hit_count += 1
+
+    if hit_count >= 2:
+        score += 3
+
+    if hit_count >= 3:
+        score += 5
+
+    if hit_count >= 4:
+        score += 7
+
+    # -----------------------------------------
+    # PANJANG PESAN PROMOSI
+    # -----------------------------------------
+    if len(compact) > 60 and hit_count >= 2:
+        score += 3
+
+    # -----------------------------------------
+    # CONTOH KHUSUS DARI SCREENSHOT
+    # -----------------------------------------
+    ultra_patterns = [
+        "v1p",
+        "v1d",
+        "fullvid",
+        "onlyfans",
+        "freshmedia",
+        "bocilviral",
+        "langsunggas",
+        "dibiyoh",
+        "pcaku",
+        "dmaku",
+        "omek",
+        "murah",
+    ]
+
+    for token in ultra_patterns:
+        if token in compact:
+            score += 3
+
+    # -----------------------------------------
+    # FINAL BOOST
+    # -----------------------------------------
+    if score >= 5:
+        score += 3
+
+    if score >= 10:
+        score += 5
+
+    return score
+
+
+# =========================================================
+# SIMILARITY
+# =========================================================
+
+class AdvancedSimilarityChecker:
+    def __init__(self, threshold=0.72):
+        self.threshold = threshold
+
+    def preprocess(self, text):
+        return unidecode(text.lower())
+
+    def levenshtein_similarity(self, s1, s2):
+        if not levenshtein_distance:
+            return difflib.SequenceMatcher(None, s1, s2).ratio()
+
+        max_len = max(len(s1), len(s2))
+        if max_len == 0:
+            return 1.0
+
+        return 1 - (levenshtein_distance(s1, s2) / max_len)
+
+    def ngram_similarity(self, s1, s2, n=2):
+        if not ngrams:
+            return difflib.SequenceMatcher(None, s1, s2).ratio()
+
+        s1_ngrams = set(ngrams(s1, n))
+        s2_ngrams = set(ngrams(s2, n))
+
+        union = len(s1_ngrams.union(s2_ngrams))
+        if union == 0:
+            return 0
+
+        inter = len(s1_ngrams.intersection(s2_ngrams))
+        return inter / union
+
+    def phonetic_similarity(self, s1, s2):
+        if not doublemetaphone:
+            return 0
+
+        return 1 if doublemetaphone(s1) == doublemetaphone(s2) else 0
+
+    def calculate_similarity(self, text1, text2):
+        text1 = self.preprocess(text1)
+        text2 = self.preprocess(text2)
+
+        lev = self.levenshtein_similarity(text1, text2)
+        ng = self.ngram_similarity(text1, text2)
+        ph = self.phonetic_similarity(text1, text2)
+
+        return (0.5 * lev) + (0.3 * ng) + (0.2 * ph)
+
+    def is_similar(self, text1, text2):
+        return self.calculate_similarity(text1, text2) >= self.threshold
+
+
+checker = AdvancedSimilarityChecker()
+
+
+# =========================================================
+# SMART AI DETECTOR
+# Tambahkan setelah: checker = AdvancedSimilarityChecker()
+# =========================================================
+
+class SmartBroadcastDetector:
+    """
+    Detector tambahan berbasis heuristik.
+    Fokus mendeteksi:
+    - l33t text (v1p, b0c1l, m3d14)
+    - huruf dipisah spasi/simbol
+    - promo seksual / media
+    - ajakan DM/PC
+    - rasio angka & simbol tidak wajar
+    """
+
+    def __init__(self):
+        self.core_keywords = [
+            "vip",
+            "v1p",
+            "vvip",
+            "premium",
+            "murah",
+            "promo",
+            "media",
+            "fresh",
+            "bocil",
+            "bokep",
+            "onlyfans",
+            "onlyf4ns",
+            "omek",
+            "vcs",
+            "openbo",
+            "openvcs",
+            "horny",
+            "sange",
+            "rate",
+            "pcaku",
+            "dmaku",
+            "chataku",
+            "dibiyoh",
+            "biyoh",
+            "langsunggas",
+            "fullvid",
+            "fullvideo",
+        ]
+
+        self.regex_rules = [
+            r"v[i1!|]p",
+            r"m[u4]r[a4]h",
+            r"b[o0]k[e3]p",
+            r"b[o0]c[i1]l",
+            r"o[mn]e[kx]",
+            r"v[c(]s",
+            r"onlyf[a4]ns?",
+            r"pc\s*a[kq]u",
+            r"dm\s*a[kq]u",
+            r"chat\s*a[kq]u",
+            r"langsung\s*gas",
+            r"full\s*v[i1]d",
+            r"fresh\s*m[e3]d[i1]a",
+        ]
+
+    def _compress(self, text: str) -> str:
+        text = normalize_text(text)
+        return compact_text(text)
+
+    def analyze(self, text: str):
+        score = 0
+        reasons = []
+
+        if not text:
+            return 0, []
+
+        raw = text
+        lowered = raw.lower()
+        compact = self._compress(raw)
+
+        # =====================================
+        # KEYWORD HIT
+        # =====================================
+        hits = 0
+        for kw in self.core_keywords:
+            token = self._compress(kw)
+            if token in compact:
+                hits += 1
+
+        if hits >= 1:
+            score += hits * 2
+            reasons.append(f"keyword_hits={hits}")
+
+        # =====================================
+        # REGEX RULES
+        # =====================================
+        regex_hits = 0
+        for pattern in self.regex_rules:
+            if re.search(pattern, compact):
+                regex_hits += 1
+
+        if regex_hits:
+            score += regex_hits * 3
+            reasons.append(f"regex_hits={regex_hits}")
+
+        # =====================================
+        # DIGIT RATIO
+        # =====================================
+        if compact:
+            digit_ratio = sum(c.isdigit() for c in raw) / max(len(raw), 1)
+            if digit_ratio >= 0.10:
+                score += 2
+                reasons.append("digit_ratio")
+            if digit_ratio >= 0.20:
+                score += 3
+
+        # =====================================
+        # SYMBOL RATIO
+        # =====================================
+        symbol_count = len(re.findall(r"[^a-zA-Z0-9\s]", raw))
+        if symbol_count >= 5:
+            score += 1
+            reasons.append("symbols")
+        if symbol_count >= 10:
+            score += 2
+
+        # =====================================
+        # REPETITIVE CHARS
+        # =====================================
+        if re.search(r"(.)\1{3,}", lowered):
+            score += 2
+            reasons.append("repeated_chars")
+
+        # =====================================
+        # URL
+        # =====================================
+        if re.search(r"(https?://|t\.me/|wa\.me)", lowered):
+            score += 5
+            reasons.append("url")
+
+        # =====================================
+        # TELEGRAM USERNAME
+        # =====================================
+        if re.search(r"@\w{4,}", raw):
+            score += 2
+            reasons.append("username")
+
+        # =====================================
+        # CONTACT CTA
+        # =====================================
+        cta_patterns = [
+            "pc aku",
+            "dm aku",
+            "chat aku",
+            "sini pc",
+            "sini dm",
+            "rate",
+            "media",
+            "cek bio",
+        ]
+
+        for cta in cta_patterns:
+            if self._compress(cta) in compact:
+                score += 2
+                reasons.append(f"cta:{cta}")
+
+        # =====================================
+        # FINAL BOOST
+        # =====================================
+        if score >= 8:
+            score += 3
+        if score >= 15:
+            score += 5
+
+        return score, reasons
+
+
+smart_detector = SmartBroadcastDetector()
+
+# =========================================================
+# DATABASE
+# =========================================================
+
+async def set_antibc(chat_id, status: bool):
+    await db.cache.update_one(
+        {"_id": f"antibc_{chat_id}"},
+        {"$set": {"status": status}},
+        upsert=True
+    )
+
+
+async def get_antibc(chat_id) -> bool:
+    data = await db.cache.find_one(
+        {"_id": f"antibc_{chat_id}"}
+    )
+    if not data:
+        return False
+    return data.get("status", False)
+
+
+# =========================================================
+# ANKES CHECK
+# =========================================================
+
+async def ankes_active(chat_id):
+    try:
+        status = await db.is_ankes(chat_id)
+        if not status:
+            return False
+
+        expired = await db.get_expired(chat_id)
+        if not expired:
+            return False
+
+        if int(time.time()) > int(expired):
+            await db.remove_ankes(chat_id)
+            return False
+
+        return True
+    except:
+        return False
+
+
+# =========================================================
+# ADMIN CHECK
+# =========================================================
+
+async def is_admin(chat_id, user_id):
+    if user_id == OWNER:
+        return True
+
+    if user_id in SUDO:
+        return True
+
+    try:
+        member = await app.get_chat_member(chat_id, user_id)
+        return member.status in [
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.OWNER,
+        ]
+    except:
+        return False
+
+
+# =========================================================
+# NOTIFICATION
+# =========================================================
+
+async def notification(chat_id, text, duration=4):
+    try:
+        msg = await app.send_message(
+            chat_id,
+            f"⚠️ {text}"
+        )
+        await asyncio.sleep(duration)
+        try:
+            await msg.delete()
+        except:
+            pass
+    except:
+        pass
+
+
+# =========================================================
+# PUNISH
+# =========================================================
+
+async def punish_user(message: Message, reason: str):
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+
+    try:
+        await message.delete()
+    except:
+        pass
+
+    try:
+        await app.restrict_chat_member(
+            chat_id,
+            user_id,
+            ChatPermissions()
+        )
+    except RPCError:
+        pass
+
+    await notification(
+        chat_id,
+        f"Broadcast terdeteksi.\nReason: {reason}"
+    )
+
+
+# =========================================================
+# COMMAND
+# =========================================================
+
+@app.on_message(filters.command("antibc") & filters.group)
+async def antibc_toggle(_, message: Message):
+    if not message.from_user:
+        return
+
+    if not await is_admin(
+        message.chat.id,
+        message.from_user.id
+    ):
+        return
+
+    if not await ankes_active(message.chat.id):
+        return await message.reply_text(
+            "❌ Group tidak memiliki akses ankes."
+        )
+
+    if len(message.command) < 2:
+        return await message.reply_text(
+            "Gunakan:\n/antibc on\n/antibc off"
+        )
+
+    arg = message.command[1].lower()
+
+    if arg == "on":
+        await set_antibc(message.chat.id, True)
+        return await message.reply_text(
+            "✅ AntiBroadcast berhasil diaktifkan."
+        )
+
+    elif arg == "off":
+        await set_antibc(message.chat.id, False)
+        return await message.reply_text(
+            "✅ AntiBroadcast berhasil dimatikan."
+        )
+
+# =========================================================
+# MAIN DETECTOR
+# =========================================================
+
+@app.on_message(filters.group & ~filters.service, group=-2)
+async def antibroadcast_main(_, message: Message):
+    try:
+        # =====================================================
+        # BASIC VALIDATION
+        # =====================================================
+        if not message:
+            return
+
+        if not message.from_user:
+            return
+
+        chat_id = message.chat.id
+        user_id = message.from_user.id
+
+        # =====================================================
+        # FEATURE CHECK
+        # =====================================================
+        if not await get_antibc(chat_id):
+            return
+
+        if not await ankes_active(chat_id):
+            return
+
+        # skip owner / sudo / admin
+        if await is_admin(chat_id, user_id):
+            return
+
+        # =====================================================
+        # GET MESSAGE TEXT
+        # =====================================================
+        text_raw = (
+            message.text
+            or message.caption
+            or ""
+        )
+
+        # media tanpa caption dan bukan forward
+        if not text_raw and not message.forward_date:
+            return
+
+        # =====================================================
+        # NORMALIZE TEXT
+        # =====================================================
+        text_raw = remove_invisible(text_raw)
+        normalized = normalize_text(text_raw)
+        compact = compact_text(normalized)
+
+        if len(compact) < 3:
+            return
+
+        # waktu & key user
+        now = time.time()
+        key = str(user_id)
+
+        # =====================================================
+        # AI + KEYWORD DETECT
+        # =====================================================
+        score = suspicious_score(text_raw)
+
+        smart_score, smart_reasons = smart_detector.analyze(
+            text_raw
+        )
+        score += smart_score
+
+        # hard token boost
+        ultra_tokens = [
+            "v1p",
+            "vip",
+            "vvip",
+            "premium",
+            "freshmedia",
+            "freshm3dia",
+            "fullvid",
+            "fullvideo",
+            "onlyfans",
+            "onlyf4ns",
+            "dibiyoh",
+            "biyoh",
+            "omek",
+            "pcaku",
+            "dmaku",
+            "chataku",
+            "murah",
+            "bokep",
+            "bocil",
+            "viral",
+            "rate",
+            "openbo",
+            "openvcs",
+            "vcs",
+        ]
+
+        for token in ultra_tokens:
+            if token in compact:
+                score += 4
+
+        # regex super agresif
+        if re.search(
+            r"(b[o0]c[i1]l|"
+            r"m[e3]d[i1]a|"
+            r"v[i1]r[a4]l|"
+            r"v[i1]d|"
+            r"onlyf[a4]ns|"
+            r"v[i1]p|"
+            r"m[u4]r[a4]h)",
+            compact
+        ):
+            score += 6
+
+        # kombinasi keyword
+        keyword_combo = [
+            "murah",
+            "vip",
+            "media",
+            "fresh",
+            "fullvid",
+            "onlyfans",
+            "dibiyoh",
+            "pcaku",
+            "dmaku",
+            "omek",
+        ]
+
+        combo_hits = 0
+        for kw in keyword_combo:
+            if kw in compact:
+                combo_hits += 1
+
+        if combo_hits >= 2:
+            score += 6
+
+        if combo_hits >= 3:
+            score += 10
+
+        # URL / username tambahan
+        if re.search(r"(https?://|t\.me/|wa\.me)", text_raw.lower()):
+            score += 5
+
+        if re.search(r"@\w{4,}", text_raw):
+            score += 2
+
+        # =====================================================
+        # AUTO PUNISH BERDASARKAN SCORE
+        # =====================================================
+        if score >= 6:
+            reason_text = f"AI Detection ({score})"
+
+            if smart_reasons:
+                reason_text += " | " + " | ".join(
+                    smart_reasons[:5]
+                )
+
+            await punish_user(
+                message,
+                reason_text
+            )
+            return
+
+        # =====================================================
+        # LOCK PER USER
+        # =====================================================
+        async with ANTIBC_LOCK[key]:
+
+            # =================================================
+            # SAME EXACT MESSAGE
+            # =================================================
+            cache = BROADCAST_CACHE[key]
+            cache.append({
+                "text": compact,
+                "time": now,
+                "chat": chat_id,
+            })
+
+            same_count = sum(
+                1
+                for x in cache
+                if (
+                    x["text"] == compact
+                    and now - x["time"] <= BC_REPEAT_TIME
+                )
+            )
+
+            if same_count >= BC_REPEAT_LIMIT:
+                await punish_user(
+                    message,
+                    "Repeated broadcast"
+                )
+                return
+
+            # =================================================
+            # SIMILAR MESSAGE
+            # =================================================
+            similar_count = 0
+
+            for x in cache:
+                if now - x["time"] > BC_SIMILAR_TIME:
+                    continue
+
+                if checker.is_similar(
+                    x["text"],
+                    compact
+                ):
+                    similar_count += 1
+
+            if similar_count >= BC_SIMILAR_LIMIT:
+                await punish_user(
+                    message,
+                    "Similar broadcast spam"
+                )
+                return
+
+            # =================================================
+            # CROSS GROUP BROADCAST
+            # =================================================
+            cross = CROSS_CHAT_CACHE[key]
+            cross.append({
+                "text": compact,
+                "chat": chat_id,
+                "time": now,
+            })
+
+            groups = set()
+
+            for x in cross:
+                if now - x["time"] > BC_REPEAT_TIME:
+                    continue
+
+                if checker.is_similar(
+                    x["text"],
+                    compact
+                ):
+                    groups.add(x["chat"])
+
+            if len(groups) >= BC_CROSSCHAT_LIMIT:
+                await punish_user(
+                    message,
+                    "Cross-group broadcast"
+                )
+                return
+
+            # =================================================
+            # FORWARD FLOOD
+            # =================================================
+            if message.forward_date:
+                fw = FORWARD_CACHE[key]
+                fw.append(now)
+
+                recent = sum(
+                    1
+                    for x in fw
+                    if now - x <= BC_FORWARD_TIME
+                )
+
+                if recent >= BC_FORWARD_LIMIT:
+                    await punish_user(
+                        message,
+                        "Forward flood"
+                    )
+                    return
+
+            # =================================================
+            # DUPLICATE LAST MESSAGE IN SAME CHAT
+            # =================================================
+            if LAST_MESSAGE[chat_id] == compact:
+                await punish_user(
+                    message,
+                    "Duplicate chat spam"
+                )
+                return
+
+            LAST_MESSAGE[chat_id] = compact
+
+    except Exception as e:
+        print(f"ANTIBC ERROR: {e}")
+
+

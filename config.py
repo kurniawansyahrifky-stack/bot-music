@@ -1,0 +1,89 @@
+from os import getenv
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+class Config:
+    def __init__(self):
+        self.API_ID = int(getenv("API_ID", 0))
+        self.API_HASH = getenv("API_HASH")
+
+        self.BOT_TOKEN = getenv("BOT_TOKEN")
+        self.MONGO_URL = getenv("MONGO_URL")
+
+        self.LOGGER_ID = int(getenv("LOGGER_ID", 0))
+        self.OWNER_ID = int(getenv("OWNER_ID", 0))
+
+        self.LOG_GROUP = int(getenv("LOG_GROUP", "-1002548602308"))
+
+        self.DURATION_LIMIT = int(getenv("DURATION_LIMIT", 60)) * 60
+        self.QUEUE_LIMIT = int(getenv("QUEUE_LIMIT", 20))
+        self.PLAYLIST_LIMIT = int(getenv("PLAYLIST_LIMIT", 20))
+
+        self.AUTO_BACKUP_HOUR = int(getenv("AUTO_BACKUP_HOUR", "0"))
+        self.AUTO_RESTART_HOUR = int(getenv("AUTO_RESTART_HOUR", "4"))
+
+        self.SESSION1 = getenv("SESSION", None)
+        self.SESSION2 = getenv("SESSION2", None)
+        self.SESSION3 = getenv("SESSION3", None)
+
+        self.SUPPORT_CHANNEL = getenv("SUPPORT_CHANNEL", "https://t.me/storegarf")
+        self.SUPPORT_CHAT = getenv("SUPPORT_CHAT", "https://t.me/garfsup")
+        self.MAELYN_KEY = getenv("MAELYN_KEY", "sk_ms_b26d6a4657ee0a694cf34193e580f33546baafd0aeda6f15")
+        self.MAILYAN_API_KEY_ANTIBC = getenv("MAILYAN_API_KEY_ANTIBC", None)
+        self.AUTO_LEAVE: bool = getenv("AUTO_LEAVE", "False").lower() == "true"
+        self.AUTO_END: bool = getenv("AUTO_END", "False").lower() == "true"
+        
+        self.SPOTIFY_CLIENT_ID = getenv("SPOTIFY_CLIENT_ID")
+        self.SPOTIFY_CLIENT_SECRET = getenv("SPOTIFY_CLIENT_SECRET")
+
+        self.MAILYAN_API_URL = getenv("MAILYAN_API_URL", "https://api.openai.com/v1/chat/completions")
+        self.MAILYAN_MODEL = getenv("MAILYAN_MODEL", "gpt-4.1-mini")
+        self.MAILYAN_TIMEOUT = int(getenv("MAILYAN_TIMEOUT", "10"))
+        self.GENIUS_API_TOKEN = getenv("GENIUS_API_TOKEN",None)
+        self.THUMB_GEN: bool = getenv("THUMB_GEN", "True").lower() == "true"
+        self.VIDEO_PLAY: bool = getenv("VIDEO_PLAY", "True").lower() == "true"
+
+        self.LANG_CODE = getenv("LANG_CODE", "en")
+
+        self.COOKIES_URL = [
+            url for url in getenv("COOKIES_URL", "").split(" ")
+            if url and "batbin.me" in url
+        ]
+
+        # PHOTO FILE ID TELEGRAM (ANTI LINK MATI)
+        self.DEFAULT_THUMB = getenv(
+            "DEFAULT_THUMB",
+            "AgACAgUAAxkBAAMuafqjsQwmZrbRD3B8tgv_4Cq---QAAjsRaxuF8tBXL6YrG7FNRw4ACAEAAwIAA3gABx4E"
+        )
+
+        self.PING_IMG = getenv(
+            "PING_IMG",
+            "AgACAgUAAxkBAAMuafqjsQwmZrbRD3B8tgv_4Cq---QAAjsRaxuF8tBXL6YrG7FNRw4ACAEAAwIAA3gABx4E"
+        )
+
+        self.START_IMG = getenv(
+            "START_IMG",
+            "AgACAgUAAxkBAAMvafqjsa_XiS6ClbRzKwVNwVw0Jt0AAjwRaxuF8tBXQ1GGhngwUpkACAEAAwIAA3kABx4E"
+        )
+
+    def check(self):
+        missing = [
+            var
+            for var in [
+                "API_ID",
+                "API_HASH",
+                "BOT_TOKEN",
+                "MONGO_URL",
+                "LOGGER_ID",
+                "OWNER_ID",
+                "SESSION1"
+            ]
+            if not getattr(self, var)
+        ]
+
+        if missing:
+            raise SystemExit(
+                f"Missing required environment variables: {', '.join(missing)}"
+            )
