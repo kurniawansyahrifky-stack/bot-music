@@ -58,6 +58,21 @@
     "help_tagall": "<u><b>TagAll commands:</b></u>\n\n/tagall [text]: Mention all members in the current group with custom message.\n\n<b>Example:</b> <code>/tagall Hello everyone</code>",
     "help_translate": "<u><b>Translate commands:</b></u>\n\n/translate: Reply to a text message then choose the translation language from the inline buttons.",     
     "help_groupinfo": "<u><b>GroupInfo commands:</b></u>\n\n/id: Check current group id, replied user id, or username id.\n\n/cekadmin: Shows all administrators in the current group with their usernames and IDs.",
+    "help_mafia": "✧ MAFIA ✧",
+    "help_mafia_1": "◈ /mafia ➠ start aesthetic mafia game",
+    "help_mafia_2": "◈ /join ➠ join the current mafia room",
+    "help_mafia_3": "◈ /startmafia ➠ begin the mafia match",
+    "help_mafia_4": "◈ /stopmafia ➠ force stop the mafia game",
+    "help_mafia_text": "◈ **MAFIA COMMANDS** ◈\n\n🎭 /mafia ➠ start a new mafia game\n👥 /join ➠ join the ongoing game\n▶️ /startmafia ➠ start the match\n⛔ /stopmafia ➠ stop the game",
+    "mafia_started": "🎭 **Mafia Game Started!**\n\nType /join to participate in the game.",
+    "mafia_joined": "👤 {0} joined the mafia game.",
+    "mafia_already_joined": "⚠️ You have already joined this game.",
+  "mafia_not_enough": "❌ Not enough players to start the game.",
+  "mafia_begin": "🎬 The mafia game has officially begun!",
+  "mafia_stopped": "🛑 Mafia game has been stopped.",
+
+  "help_15": "Mafia"
+
     "lang_choose": "Please choose the language you want to set for the current chat:",
     "lang_change": "Changing the language of the current chat to: {0}",
     "lang_changed": "The language of the current chat has been changed to: <i>{0}</i>",
