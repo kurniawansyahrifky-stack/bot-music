@@ -67,12 +67,9 @@
     "mafia_started": "🎭 **Mafia Game Started!**\n\nType /join to participate in the game.",
     "mafia_joined": "👤 {0} joined the mafia game.",
     "mafia_already_joined": "⚠️ You have already joined this game.",
-  "mafia_not_enough": "❌ Not enough players to start the game.",
-  "mafia_begin": "🎬 The mafia game has officially begun!",
-  "mafia_stopped": "🛑 Mafia game has been stopped.",
-
-  "help_15": "Mafia"
-
+    "mafia_not_enough": "❌ Not enough players to start the game.",
+    "mafia_begin": "🎬 The mafia game has officially begun!",
+    "mafia_stopped": "🛑 Mafia game has been stopped.",
     "lang_choose": "Please choose the language you want to set for the current chat:",
     "lang_change": "Changing the language of the current chat to: {0}",
     "lang_changed": "The language of the current chat has been changed to: <i>{0}</i>",
@@ -184,5 +181,6 @@
     "help_11": "GroupInfo",
     "help_12": "AI GPT",
     "help_13": "Pinterest",
-    "help_14": "ToUrl"
+    "help_14": "ToUrl",
+    "help_15": "Mafia"
 }
