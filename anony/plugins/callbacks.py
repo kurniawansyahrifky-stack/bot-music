@@ -199,7 +199,6 @@ async def _help(_, query: types.CallbackQuery):
     data = query.data.split()
 
     if len(data) == 1:
-
         return await query.answer(
             url=f"https://t.me/{app.username}?start=help"
         )
@@ -209,7 +208,6 @@ async def _help(_, query: types.CallbackQuery):
     if cmd == "close":
 
         try:
-
             await query.message.delete()
 
             if query.message.reply_to_message:
@@ -246,6 +244,19 @@ async def _help(_, query: types.CallbackQuery):
             )
         )
 
+    elif cmd == "page3":
+
+        return await query.edit_message_media(
+            media=types.InputMediaPhoto(
+                media=config.START_IMG,
+                caption=query.lang["help_menu"]
+            ),
+            reply_markup=buttons.help_markup(
+                query.lang,
+                page=3
+            )
+        )
+
     elif cmd == "back":
 
         return await query.edit_message_media(
@@ -259,12 +270,30 @@ async def _help(_, query: types.CallbackQuery):
             )
         )
 
+    elif cmd == "back2":
+
+        return await query.edit_message_media(
+            media=types.InputMediaPhoto(
+                media=config.START_IMG,
+                caption=query.lang["help_menu"]
+            ),
+            reply_markup=buttons.help_markup(
+                query.lang,
+                page=2
+            )
+        )
+
+    # Semua module help termasuk tambahan:
+    # mafia, antispam, antibc
     return await query.edit_message_media(
         media=types.InputMediaPhoto(
             media=config.START_IMG,
             caption=query.lang.get(
-                f"help_{cmd}",
-                query.lang["help_menu"]
+                f"help_{cmd}_text",
+                query.lang.get(
+                    f"help_{cmd}",
+                    query.lang["help_menu"]
+                )
             )
         ),
         reply_markup=buttons.help_markup(
@@ -272,7 +301,6 @@ async def _help(_, query: types.CallbackQuery):
             back=True
         )
     )
-
 
 # ==========================================
 # SETTINGS CALLBACK
